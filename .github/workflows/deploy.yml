@@ -1,0 +1,84 @@
+name: Build and Deploy Node.js App
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: node-app-production
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -t "$DOCKER_USER/my-node-app:$IMAGE_TAG" \
+            -t "$DOCKER_USER/my-node-app:latest" \
+            .
+
+          docker push "$DOCKER_USER/my-node-app:$IMAGE_TAG"
+          docker push "$DOCKER_USER/my-node-app:latest"
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Deploy to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=yes \
+            "ubuntu@$EC2_HOST" \
+            "DOCKER_USER='$DOCKER_USER' IMAGE_TAG='$IMAGE_TAG' bash -s" <<'REMOTE'
+          set -eu
+
+          IMAGE="$DOCKER_USER/my-node-app:$IMAGE_TAG"
+
+          sudo docker pull "$IMAGE"
+
+          sudo docker stop my-node-app || true
+          sudo docker rm my-node-app || true
+
+          sudo docker run -d \
+            --name my-node-app \
+            --restart unless-stopped \
+            -p 80:3000 \
+            "$IMAGE"
+
+          sudo docker image prune -f
+          REMOTE
